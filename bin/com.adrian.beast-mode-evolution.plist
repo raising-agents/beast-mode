@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.adrian.beast-mode-evolution</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/miniconda3/bin/python</string>
+        <string>/Users/adriandelasierra/.claude/beast-mode/bin/evolution.py</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>57</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/adriandelasierra/.claude/beast-mode/ledger/evolution.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/adriandelasierra/.claude/beast-mode/ledger/evolution.err</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/adriandelasierra/.local/bin:/opt/miniconda3/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

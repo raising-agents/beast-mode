@@ -1,0 +1,9 @@
+ledger/
+proposals/
+receipts/
+analysis/
+__pycache__/
+*.pyc
+*.log
+backfill-*.py
+backfill-state.json
