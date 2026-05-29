@@ -52,7 +52,7 @@ if applicable == 0:
     sys.exit(0)
 pct = beasts / applicable * 100
 parts = [f"BEAST {beasts}/{applicable} {pct:.0f}%"]
-short = {"parallelism":"par","scope":"sc","depth":"dep","sequencing":"seq","deferrals":"def","boldness":"bold"}
+short = {"parallelism":"par","scope":"sc","depth":"dep","boldness":"bold","action_over_announcement":"ann","verification_by_evidence":"ver","sequencing":"seq","deferrals":"def"}
 top = [f"{short.get(d, d)}x{n}" for d, n in leak_dims.most_common(3)]
 if top:
     parts.append("leak:" + ",".join(top))

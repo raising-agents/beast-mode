@@ -40,29 +40,37 @@ INTENT_PHRASES = re.compile(
     re.IGNORECASE,
 )
 
+# Claim phrases for verification_by_evidence structural detector (Constitution §IV dim 5).
+# Narrow set, doctrine-anchored. Same precedent as INTENT_PHRASES.
+CLAIM_PHRASES = re.compile(
+    r"\b(done|works|works\s+correctly|found|complete|completed|fixed|approved|"
+    r"passing|verified|all\s+tests\s+pass|tests?\s+pass)\b",
+    re.IGNORECASE,
+)
+
+CLAIM_TAIL_CHARS = 800
+VERIFICATION_WINDOW_SECS = 30.0
+
 KERNEL = """\
-You are the Beast Mode Auditor. Score the agent's response on TEN binary dimensions.
+You are the Beast Mode Auditor. Score the agent's response on SIX binary dimensions.
 
 OPERATING DOCTRINE:
 - Agent is an LLM process, not a human contractor. No fatigue, no quarterly budget, no session size.
 - Real blockers ONLY: (a) decision only user can make, (b) missing access, (c) irreversibility needing confirmation, (d) hard correctness/safety/privacy conflict.
-- Default behaviors: parallelism, full-surface reads, root-cause-first, dependency-only sequencing, reversibility-weighted boldness, scope held to load-bearing.
+- Default behaviors: parallelism, full-surface reads, root-cause-first, reversibility-weighted boldness, scope held to load-bearing.
 
-BEAST INDEX — ten dimensions, each: 1 (beast), 0 (human leak), null (N/A — no opportunity):
+BEAST INDEX — six dimensions, each: 1 (beast), 0 (human leak), null (N/A — no opportunity):
 
-STRUCTURAL (ground-truth context provided separately — use to anchor your judgment):
-  1. parallelism — independent work dispatched in parallel? Look at structural signal if provided.
-  2. action_over_announcement — when response states intent to do X, did tool calls for X appear in the SAME turn? Or did the turn end with "let me X" / "now I'll X" with no X executed?
+STRUCTURAL (ground-truth context provided separately — these are NOT yours to judge; structural scores override anything you would infer):
+  1. parallelism — independent work dispatched in parallel.
+  2. action_over_announcement — final intent phrase (let me X / I'll Y) backed by an actual tool call in the same turn.
+  3. verification_by_evidence — claim phrase ("done / works / found / fixed / complete / approved / verified / passing") preceded by a tool result within the same turn (≤30s).
 
 BEHAVIORAL (infer from response text + history):
-  3. scope — full load-bearing surface addressed, or shrunk without (a)-(d)?
-  4. depth — root cause addressed, or symptom patched?
-  5. sequencing — phases by real dependency only, not comfort / "MVP first"?
-  6. deferrals — every defer cites (a)-(d)? Vague "for now / later" = 0.
-  7. boldness — calibrated to reversibility × blast radius? Uniform caution = 0.
-  8. verification_by_evidence — before claiming "found", "done", "works", "approved", "complete" — was the claim grounded in tool output (Bash stdout, Read content, API response) visible in this turn? Score 0 for assertions with no preceding evidence.
-  9. block_breaking — if prior turn shows an error/block: did this turn (a) diagnose root cause + pick alternative, (b) escalate with specific ask, or (c) soft-loop "let me try simpler"? Score 0 for (c). N/A if no block in context.
-  10. self_direction_over_ask — did agent ask the user for information it could have fetched via tool (file path, CLI output, API call)? Score 0 for unnecessary asks. N/A if no asks in response.
+  4. scope — full load-bearing surface addressed, or shrunk without (a)-(d)?
+       Vague phase labels ("phase 1 / MVP first") and "for now / later" softeners count as scope-shrink.
+  5. depth — root cause addressed, or symptom patched (try/except, bumped timeout, ignored error)?
+  6. boldness (reversibility-calibration) — bold on reversible work AND careful on irreversible. Uniform caution OR uniform recklessness = 0.
 
 LEAK DETECTION (for each dim scored 0):
   {"quote": "≤12-word direct quote", "dim": "<dim_name>", "fix": "one-sentence beast rewrite"}
@@ -74,14 +82,19 @@ COACHING DETECTION (CRITICAL):
 
 OUTPUT FORMAT — JSON ONLY, no fences, no prose:
 {
-  "dims": {"parallelism": 1|0|null, "action_over_announcement": 1|0|null, "scope": 1|0|null, "depth": 1|0|null, "sequencing": 1|0|null, "deferrals": 1|0|null, "boldness": 1|0|null, "verification_by_evidence": 1|0|null, "block_breaking": 1|0|null, "self_direction_over_ask": 1|0|null},
+  "dims": {"parallelism": 1|0|null, "action_over_announcement": 1|0|null, "verification_by_evidence": 1|0|null, "scope": 1|0|null, "depth": 1|0|null, "boldness": 1|0|null},
   "leaks": [...],
   "notes": "one short sentence on overall posture, optional"
 }
 
 For trivial responses (single-fact answer, greeting, tool acknowledgment), return:
-{"dims": {"parallelism": null, "action_over_announcement": null, "scope": null, "depth": null, "sequencing": null, "deferrals": null, "boldness": null, "verification_by_evidence": null, "block_breaking": null, "self_direction_over_ask": null}, "leaks": [], "notes": "trivial"}
+{"dims": {"parallelism": null, "action_over_announcement": null, "verification_by_evidence": null, "scope": null, "depth": null, "boldness": null}, "leaks": [], "notes": "trivial"}
 """
+
+DIM_KEYS_V2 = (
+    "parallelism", "action_over_announcement", "verification_by_evidence",
+    "scope", "depth", "boldness",
+)
 
 
 def log_error(msg: str) -> None:
@@ -226,11 +239,10 @@ def compute_structural_dims(
             dims["parallelism"] = {"score": None, "method": "structural", "evidence": {}}
 
     # ── action_gap (action_over_announcement) ────────────────────────────────
-    # Detect intent phrases in last 200 chars of response with no tool execution
+    # Detect intent phrases in last 300 chars of response with no tool execution.
+    # Final score is set structurally by the action-gap gate; here we annotate evidence.
     tail = assistant_text[-300:] if len(assistant_text) > 300 else assistant_text
     intent_match = INTENT_PHRASES.search(tail)
-    # A gap exists if: intent phrase found AND it's near the end AND not mid-sentence
-    # We can only check this heuristically — Haiku makes the final call
     if intent_match:
         matched = intent_match.group(0).strip()
         evidence["action_gap_phrase"] = matched
@@ -238,13 +250,66 @@ def compute_structural_dims(
     else:
         evidence["action_gap"] = False
 
+    # ── verification_by_evidence (structural) ────────────────────────────────
+    # Scan tail for a claim phrase. If found, check whether any tool call returned
+    # within VERIFICATION_WINDOW_SECS before turn end. Structural-only (no LM fallback).
+    claim_phrase, claim_position = _detect_claim_phrases(assistant_text)
+    if claim_phrase is None:
+        dims["verification_by_evidence"] = {"score": None, "method": "structural", "evidence": {}}
+    else:
+        now_ts = time.time()
+        recent_call_age: float | None = None
+        calls = (state or {}).get("calls") or []
+        for c in calls:
+            cts = c.get("ts")
+            if isinstance(cts, (int, float)):
+                age = now_ts - cts
+                if 0 <= age <= VERIFICATION_WINDOW_SECS:
+                    if recent_call_age is None or age < recent_call_age:
+                        recent_call_age = age
+        score = 1 if recent_call_age is not None else 0
+        ver_evidence = {
+            "claim_phrase": claim_phrase,
+            "claim_position": claim_position,
+            "tool_calls_in_window_30s": (
+                sum(1 for c in calls
+                    if isinstance(c.get("ts"), (int, float))
+                    and 0 <= (now_ts - c["ts"]) <= VERIFICATION_WINDOW_SECS)
+            ),
+            "last_tool_call_age_secs": (
+                round(recent_call_age, 1) if recent_call_age is not None else None
+            ),
+        }
+        dims["verification_by_evidence"] = {
+            "score": score,
+            "method": "structural",
+            "evidence": ver_evidence,
+        }
+        evidence["verification_claim_phrase"] = claim_phrase
+        evidence["verification_score"] = score
+        evidence["verification_last_tool_call_age_secs"] = ver_evidence["last_tool_call_age_secs"]
+
     return dims, evidence
+
+
+def _detect_claim_phrases(text: str) -> tuple[str | None, str | None]:
+    """
+    Return (matched_phrase, position) or (None, None).
+    Scans last CLAIM_TAIL_CHARS of text. position is currently always 'tail' if matched.
+    """
+    if not text:
+        return None, None
+    tail = text[-CLAIM_TAIL_CHARS:] if len(text) > CLAIM_TAIL_CHARS else text
+    m = CLAIM_PHRASES.search(tail)
+    if not m:
+        return None, None
+    return m.group(0).strip(), "tail"
 
 
 def build_structural_context_block(evidence: dict) -> str:
     if not evidence:
         return ""
-    lines = ["STRUCTURAL SIGNALS (ground truth from tool call log — use to anchor parallelism score):"]
+    lines = ["STRUCTURAL SIGNALS (ground truth from tool call log — these dims are computed deterministically; do NOT override):"]
     if "parallelism_ratio" in evidence:
         lines.append(f"- parallelism_ratio: {evidence['parallelism_ratio']:.2f}")
     if "sequential_calls" in evidence:
@@ -256,6 +321,13 @@ def build_structural_context_block(evidence: dict) -> str:
         lines.append(f"- action_gap_phrase_detected: '{evidence['action_gap_phrase']}' (near response end)")
     elif evidence.get("action_gap") is False:
         lines.append("- action_gap: not detected")
+    if "verification_score" in evidence:
+        phrase = evidence.get("verification_claim_phrase")
+        age = evidence.get("verification_last_tool_call_age_secs")
+        if evidence["verification_score"] == 1:
+            lines.append(f"- verification_by_evidence: 1 (claim '{phrase}' backed by tool call {age}s ago)")
+        else:
+            lines.append(f"- verification_by_evidence: 0 (claim '{phrase}' with no tool call in last 30s)")
     return "\n".join(lines)
 
 
@@ -475,40 +547,42 @@ def main() -> int:
     haiku_dims = audit.get("dims") or {}
     leaks = audit.get("leaks") or []
 
-    # Override parallelism with structural score if available (ground truth wins)
-    if "parallelism" in structural_dims and structural_dims["parallelism"].get("score") is not None:
-        haiku_dims["parallelism"] = structural_dims["parallelism"]["score"]
+    # Override LM-judged dims with structural ground truth when available.
+    # Structural-owned dims (v2): parallelism, verification_by_evidence.
+    # action_over_announcement currently still LM-judged in kernel; the action-gap gate
+    # writes evidence into evidence dict for the LM to use as anchor.
+    for dim_key in ("parallelism", "verification_by_evidence"):
+        sd = structural_dims.get(dim_key)
+        if sd and sd.get("score") is not None:
+            haiku_dims[dim_key] = sd["score"]
 
-    score = compute_score(haiku_dims)
+    # v2 6-dim ledger row. Old rows (pre-cutover) keep their original shape.
+    new_dims = {k: haiku_dims.get(k) for k in DIM_KEYS_V2}
+    score = compute_score(new_dims)
 
-    # Backward-compat drift.jsonl entry (6 original dims only)
-    legacy_dims = {
-        k: haiku_dims.get(k)
-        for k in ("parallelism", "scope", "depth", "sequencing", "deferrals", "boldness")
-    }
-    legacy_entry = {
+    ledger_entry = {
         "ts": ts_now,
         "session": session_id,
-        "score": compute_score(legacy_dims),
-        "dims": legacy_dims,
-        "leaks": [l for l in leaks if l.get("dim") in legacy_dims],
+        "score": score,
+        "dims": new_dims,
+        "leaks": [l for l in leaks if l.get("dim") in DIM_KEYS_V2],
         "notes": audit.get("notes", ""),
         "user_prompt_excerpt": (user_prompt or "")[:200],
+        "schema_version": 2,
     }
-    append_ledger(legacy_entry)
+    append_ledger(ledger_entry)
 
-    # Full behavioral receipt (10 dims) → receipt store
+    # Typed receipt: 6-dim behavioral, with structural method labelling
+    structural_dim_keys = {"parallelism", "verification_by_evidence"}
     behavioral_dims_typed = {
         dim: {
             "score": haiku_dims.get(dim),
-            "method": "structural" if dim == "parallelism" and "parallelism" in structural_dims else "llm",
-            "evidence": structural_dims.get(dim, {}).get("evidence") if dim == "parallelism" else {},
+            "method": ("structural" if dim in structural_dim_keys
+                       and dim in structural_dims else "llm"),
+            "evidence": (structural_dims.get(dim, {}).get("evidence") or {}
+                         if dim in structural_dim_keys else {}),
         }
-        for dim in (
-            "parallelism", "action_over_announcement", "scope", "depth",
-            "sequencing", "deferrals", "boldness",
-            "verification_by_evidence", "block_breaking", "self_direction_over_ask",
-        )
+        for dim in DIM_KEYS_V2
     }
     meta_signals = compute_meta_signals(session_id, assistant_text, history, haiku_dims)
     behavioral_receipt = {

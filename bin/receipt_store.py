@@ -20,12 +20,11 @@ from typing import Iterator
 RECEIPT_DIR = Path.home() / ".claude" / "beast-mode" / "receipts"
 _write_lock = threading.Lock()
 
-DIMS_STRUCTURAL = {"parallelism", "action_gap", "coverage", "self_direction"}
-DIMS_BEHAVIORAL = {
-    "scope", "depth", "deferrals", "boldness",
-    "verification_by_evidence", "action_over_announcement",
-    "block_breaking", "self_direction_over_ask",
+DIMS_STRUCTURAL = {
+    "parallelism", "action_gap", "action_over_announcement",
+    "verification_by_evidence", "coverage", "self_direction",
 }
+DIMS_BEHAVIORAL = {"scope", "depth", "boldness"}
 DIMS_META = {"coaching_dependency", "self_audit_rate", "in_session_compounding", "recovery_posture"}
 
 ALL_DIMS = DIMS_STRUCTURAL | DIMS_BEHAVIORAL | DIMS_META
