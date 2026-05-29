@@ -251,9 +251,13 @@ def build_digest(entries: list[dict], typed_receipts: dict | None = None) -> str
     return "\n".join(lines)
 
 
-def call_opus(digest: str) -> str | None:
+def call_llm(model: str, digest: str) -> tuple[str | None, str]:
+    """
+    Try one model. Returns (proposal_text_or_None, diagnostic).
+    diagnostic is a short string describing what happened (for proposal fallback + health).
+    """
     if os.environ.get("BEAST_MODE_INTERPRETER_RUNNING") == "1":
-        return None
+        return None, f"{model}: recursion guard BEAST_MODE_INTERPRETER_RUNNING=1"
     env = os.environ.copy()
     env["BEAST_MODE_INTERPRETER_RUNNING"] = "1"
 
@@ -267,7 +271,7 @@ def call_opus(digest: str) -> str | None:
 
     cmd = [
         CLAUDE_BIN, "-p",
-        "--model", "opus",
+        "--model", model,
         "--append-system-prompt", OPUS_KERNEL,
         payload,
     ]
@@ -278,10 +282,43 @@ def call_opus(digest: str) -> str | None:
             timeout=600, env=env, stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
-        return None
+        return None, f"{model}: timeout after 600s"
+    except Exception as e:
+        return None, f"{model}: subprocess error {type(e).__name__}: {e}"
+
     if result.returncode != 0:
-        return None
-    return result.stdout.strip()
+        stderr_tail = (result.stderr or "").strip()[-400:]
+        stdout_tail = (result.stdout or "").strip()[-400:]
+        return None, (f"{model}: rc={result.returncode}\n"
+                      f"stderr: {stderr_tail}\nstdout: {stdout_tail}")
+
+    text = (result.stdout or "").strip()
+    if not text:
+        return None, f"{model}: empty stdout (rc=0)"
+
+    return text, f"{model}: ok"
+
+
+# Backward-compat shim — some tests / external scripts may import call_opus.
+def call_opus(digest: str) -> str | None:
+    text, _ = call_llm("opus", digest)
+    return text
+
+
+# ─── health record (lazy import to avoid circular issues) ─────────────────────
+
+def _record_health(status: str, error: str | None = None,
+                   extra: dict | None = None) -> None:
+    try:
+        import importlib.util
+        health_path = Path(__file__).parent / "health.py"
+        spec = importlib.util.spec_from_file_location("health", health_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.record("evolution", status, error=error, extra=extra)
+    except Exception:
+        # Health record is best-effort. Never block evolution on it.
+        pass
 
 
 def main() -> int:
@@ -297,18 +334,46 @@ def main() -> int:
         (PROPOSAL_DIR / f"{today}-noop.md").write_text(
             f"# Beast Mode Evolution — {today}\n\nNo ledger entries in the past {WINDOW_DAYS} days. No proposal generated.\n"
         )
+        _record_health("ok", extra={"model_used": None, "outcome": "noop"})
         return 0
 
-    proposal = call_opus(digest)
+    # Try Opus first, fall back to Sonnet on failure.
+    diagnostics: list[str] = []
+    proposal: str | None = None
+    model_used: str | None = None
+
+    for model in ("opus", "sonnet"):
+        text, diag = call_llm(model, digest)
+        diagnostics.append(diag)
+        if text:
+            proposal = text
+            model_used = model
+            break
+
     if not proposal:
+        diag_block = "\n\n".join(diagnostics)
         (PROPOSAL_DIR / f"{today}-error.md").write_text(
-            f"# Beast Mode Evolution — {today}\n\nOpus call failed or timed out.\n\n## Digest fallback\n\n{digest}\n"
+            f"# Beast Mode Evolution — {today}\n\n"
+            f"## LLM call failed (all models exhausted)\n\n"
+            f"```\n{diag_block}\n```\n\n"
+            f"## Digest fallback\n\n{digest}\n"
         )
+        _record_health("error", error=diag_block[:300],
+                        extra={"model_used": None, "outcome": "llm_failed"})
+        print(f"[evolution] all models failed", file=sys.stderr)
+        for d in diagnostics:
+            print(f"[evolution] {d}", file=sys.stderr)
         return 1
 
     proposal_path = PROPOSAL_DIR / f"{today}-amendment.md"
-    proposal_path.write_text(proposal)
-    print(f"Wrote {proposal_path}")
+    # If we used the fallback model, prepend a note for Adrian
+    header = ""
+    if model_used != "opus":
+        header = (f"<!-- Evolution: Opus failed, used {model_used} fallback. "
+                  f"Diagnostics: {diagnostics[0]!r} -->\n\n")
+    proposal_path.write_text(header + proposal)
+    _record_health("ok", extra={"model_used": model_used, "outcome": "amendment"})
+    print(f"[evolution] wrote {proposal_path} via {model_used}")
     return 0
 
 

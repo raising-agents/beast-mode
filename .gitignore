@@ -2,8 +2,14 @@ ledger/
 proposals/
 receipts/
 analysis/
+rules/
+digests/
+calibration/
+health.json
 __pycache__/
 *.pyc
 *.log
+*.err
 backfill-*.py
 backfill-state.json
+.DS_Store

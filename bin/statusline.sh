@@ -67,9 +67,17 @@ if [[ -n "$STDIN_JSON" ]]; then
     MODEL=$(printf '%s' "$STDIN_JSON" | /opt/homebrew/bin/jq -r '.model.display_name // .model.id // empty' 2>/dev/null || true)
 fi
 
+# Compose health badge: EVOL ERR / AUDIT ERR / EVOL STALE (empty if all healthy).
+HEALTH=""
+HEALTH_SCRIPT="$HOME/.claude/beast-mode/bin/health.py"
+if [[ -x "$HEALTH_SCRIPT" ]]; then
+    HEALTH=$(/opt/miniconda3/bin/python3 "$HEALTH_SCRIPT" status 2>/dev/null || true)
+fi
+
 # Assemble.
 OUT=""
 [[ -n "$LEFT" ]] && OUT="$LEFT"
 [[ -n "$BEAST" ]] && OUT="$OUT$BEAST"
+[[ -n "$HEALTH" ]] && OUT="$OUT  ${HEALTH}"
 [[ -n "$MODEL" ]] && OUT="$OUT  ${MODEL}"
 printf '%s' "${OUT:-Claude Code}"

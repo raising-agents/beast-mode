@@ -410,6 +410,22 @@ def compute_meta_signals(
     }
 
 
+# ─── Health record (lazy import, best-effort) ────────────────────────────────
+
+def _record_health(status: str, error: str | None = None) -> None:
+    try:
+        import importlib.util
+        health_path = Path(__file__).parent / "health.py"
+        if not health_path.exists():
+            return
+        spec = importlib.util.spec_from_file_location("health", health_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.record("auditor", status, error=error)
+    except Exception:
+        pass
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -434,6 +450,7 @@ def main() -> int:
 
     assistant_text, user_prompt, history = extract_last_assistant(transcript_path)
     if not assistant_text.strip():
+        _record_health("skipped")
         return 0
 
     structural_dims, evidence = compute_structural_dims(structural_state, assistant_text)
@@ -452,6 +469,7 @@ def main() -> int:
     # ── Phase 2: behavioral (Haiku) ──────────────────────────────────────────
     audit = call_haiku(user_prompt or "", assistant_text, history, structural_context)
     if not audit:
+        _record_health("error", error="haiku call returned None")
         return 1
 
     haiku_dims = audit.get("dims") or {}
@@ -506,6 +524,7 @@ def main() -> int:
     }
     write_receipt_via_store(behavioral_receipt)
 
+    _record_health("ok")
     return 0
 
 
